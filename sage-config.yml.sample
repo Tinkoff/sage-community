@@ -1,0 +1,7 @@
+---
+# Specify the docker network to be used for Sage containers
+sagenet:
+  ipam:
+    gateway: 10.102.0.1
+    iprange: 10.102.0.0/16
+    subnet: 10.102.0.0/16

@@ -6,8 +6,15 @@ usage: $0 <cmd>
 
 Available commands:
 - check:     check you system's conformance to minimal requirements
+
 - install:   install Sage Community
+    -c CONFIG, --config CONFIG          Specify Sage config
+    -h HOSTNAME, --hostname HOSTNAME    Bind to HOSTNAME instead of default <ip>.nip.io.
+                                        Note that HOSTNAME cannot be IP address, since
+                                        it is used to generate certificates.
+
 - group-add: add new group to Sage Community
+
 - wipe:      delete Sage Community and remove created data
 
 To install Sage Community, run commands:
@@ -21,10 +28,54 @@ To add groups to Sage Community, run commands:
 EOF
 }
 
-if [ "$#" -gt 2 ]; then
-    usage 1>&2
-    exit 1
+case "$1" in
+    check | install | group-add | wipe )
+        SUBCOMMAND="$1"
+        shift
+    ;;
+    *)
+        usage >&2
+        exit 1
+    ;;
+esac
+
+TEMP=$(getopt -o 'c:h:' --long 'config:,hostname:' -n "$0" -- "$@")
+
+if [ $? -ne 0 ]; then
+        echo 'Terminating...' >&2
+        exit 1
 fi
+
+eval set -- "$TEMP"
+unset TEMP
+
+while true; do
+    case "$1" in
+        '-h'|'--hostname')
+            hostname="$2"
+            shift 2
+            continue
+        ;;
+        '-c'|'--config')
+            config="$2"
+            if [ ! -e "$config" ]; then
+                echo "File '$config' does not exist" >&2
+                exit 1
+            fi
+            shift 2
+            continue
+        ;;
+        '--')
+            shift
+            break
+        ;;
+        *)
+            echo 'Internal error!' >&2
+            exit 1
+        ;;
+    esac
+done
+
 
 # Making variables visible in inner bash sessions
 make_vars_pre () {
@@ -35,13 +86,9 @@ make_vars_pre () {
     export ansible_host="$(hostnamectl --static)"
     export ssh_port='2222'
     export ssh_bind='127.0.0.1'
-    if [ -e '.external_hostname' ]; then
-        export ansible_host="$(cat .external_hostname)"
-        if [ -e "${SSH_AUTH_SOCK}" ]; then
-            export ssh_port='22'
-        fi
-        export ssh_bind='0.0.0.0'
-        export docker_args="${docker_args} -e EXTERNAL_HOSTNAME=${ansible_host} -e ACCEPT_EULA=yes"
+    if [ -n "${hostname}" ]; then
+        export ansible_host="$hostname"
+        export docker_args=("${docker_args[@]}" -e EXTERNAL_HOSTNAME=${ansible_host})
     fi
 }
 
@@ -62,7 +109,7 @@ check () {
         echo "Please, try running 'apt update && apt install openssh-server'."
         fail=1
     fi
-    
+
     if ! command -v docker >/dev/null; then
         echo "Your system does not have docker installed."
         echo "Please, follow instructions on 'https://docs.docker.com/engine/install/ubuntu/'" \
@@ -115,11 +162,13 @@ check () {
     if [ -n "${fail}" ]; then
         exit 1
     fi
+
+    echo 'OK'
 }
 
 config () {
     echo "${vault_pass}" > "${vault_file}"
-    # if [ ! -e '.external_hostname' -a -z "$(cat /etc/hosts | grep ${ansible_host})" ]; then
+    # if [ ! -e '.external_hostname' ] && ! grep -q ${ansible_host:-placeholder} /etc/hosts ; then
     #     echo '--> Create hosts record'
     #     echo "127.0.0.1 ${ansible_host}" | sudo tee -a /etc/hosts
     # fi
@@ -138,26 +187,22 @@ EOF
 
     echo '--> Generate sudoers.d config'
     echo 'Please, enter sudo password, if requested:'
-    sudo tee /etc/sudoers.d/sage-demo >/dev/null <<EOF
+    sudo tee /etc/sudoers.d/sage-community >/dev/null <<EOF
 # This file is needed for the Sage Community installation only
 # User privilege specification
 $(id -un) ALL=(ALL) NOPASSWD: ALL
 EOF
-
-    if [ -e "${SSH_AUTH_SOCK}" -a -e '.external_hostname' ]; then
-        return
-    fi
 
     echo '--> Make directories'
     mkdir -p /tmp/sage "${ssh_dir}"
     chmod 700 "${ssh_dir}"
 
     echo '--> Generate temporary ssh key for the installation'
-    ssh-keygen -t rsa -N '' -f "${ssh_dir}/sage-demo" <<<y >/dev/null
+    ssh-keygen -t rsa -N '' -f "${ssh_dir}/sage-community" <<<y >/dev/null
     ssh-keygen -t rsa -N '' -f "${ssh_dir}/sage_host_key" <<<y >/dev/null
 
     echo '--> Generate temporary sshd configuration'
-    cat "${ssh_dir}/sage-demo.pub" > "${ssh_dir}/sage_authorized_keys"
+    cat "${ssh_dir}/sage-community.pub" > "${ssh_dir}/sage_authorized_keys"
     chmod 600 "${ssh_dir}/sage_authorized_keys"
     cat > "${ssh_dir}/sage-config" <<EOF
 Port ${ssh_port}
@@ -190,7 +235,7 @@ unconfig () {
     rm -f "${vault_file}"
 
     echo 'Please, enter sudo password, if requested:'
-    sudo rm -f /etc/sudoers.d/sage-demo
+    sudo rm -f /etc/sudoers.d/sage-community
 
     echo '--> Logout from Tinkoff container registry'
     sudo docker logout cr.yandex
@@ -198,13 +243,10 @@ unconfig () {
 
 # Must be called in subshell due to running ssh-agent
 sshd_up () {
-    if [ -e "${SSH_AUTH_SOCK}" -a -e '.external_hostname' ]; then
-        return
-    fi
     # sshd requires absolute path to start
     $(which sshd) -f "${ssh_dir}/sage-config"
     eval $(ssh-agent)
-    ssh-add "${ssh_dir}/sage-demo"
+    ssh-add "${ssh_dir}/sage-community"
 }
 
 sshd_down () {
@@ -217,8 +259,8 @@ sshd_down () {
 }
 
 make_vars_post () {
-    export docker_args="
-        ${docker_args}
+    docker_args=(
+        "${docker_args[@]}"
         -it
         --pull always
         --name sage-installer
@@ -229,9 +271,29 @@ make_vars_post () {
         -v $(readlink -f ${SSH_AUTH_SOCK}):/ssh-agent
         -e SSH_AUTH_SOCK=/ssh-agent
         -e ANSIBLE_SSH_PORT=${ssh_port}
+    )
+
+    if [ -n "$config" ]; then
+        docker_args=(
+            "${docker_args[@]}"
+            -v "$(pwd)/$config:/root/ansible/ext_config.yml"
+            -e ANSIBLE_EXTRA_ARGS='--extra-vars @/root/ansible/ext_config.yml'
+        )
+
+        # Map address if specified
+        if grep -q sagenet "$config"; then
+            docker_args=(
+                "${docker_args[@]}"
+                --add-host $(grep gateway "$config" | grep -o '[0-9.]*' | head -1).nip.io:127.0.0.1
+            )
+        fi
+    fi
+
+    export docker_args=(
+        "${docker_args[@]}"
         cr.yandex/crprr2k9fm05ldok4bht/sage-trukk-demo:latest
-        /root/ansible/setup-demo.sh
-    "
+        /root/ansible/setup-community.sh
+    )
 }
 
 abs_filename () {
@@ -244,19 +306,15 @@ docker_rm () {
 
 docker_run () {
     docker_rm
-    sudo docker run ${docker_args} $1 ${ansible_user} ${ansible_host}
+    sudo docker run "${docker_args[@]}" $SUBCOMMAND ${ansible_user} ${ansible_host}
 }
 
-case "$1" in
+case "$SUBCOMMAND" in
     "check")
         check
     ;;
     "install")
         (
-            if [ -n "$2" ]; then
-                echo $2 > .external_hostname
-            fi
-
             make_vars_pre
             config
             sshd_up
@@ -284,13 +342,13 @@ case "$1" in
             make_vars_pre
             config
             sshd_up
-            export docker_args="
-                ${docker_args}
+            export docker_args=(
+                ${docker_args[@]}
                 --rm
                 -e ACCEPT_EULA=yes
                 -v "$(abs_filename $2)":/root/ansible/new_groups.yml
                 -v $(pwd)/demo_local_localhost.tgz.gpg:/root/ansible/files/certificates/demo_local_localhost.tgz.gpg
-            "
+            )
             make_vars_post
 
             docker_run $*
@@ -304,19 +362,17 @@ case "$1" in
             make_vars_pre
             config
             sshd_up
-            export docker_args="
-                ${docker_args}
+            export docker_args=(
+                ${docker_args[@]}
                 --rm
                 -e ACCEPT_EULA=yes
-            "
+            )
             make_vars_post
-            
+
             docker_run $*
 
             sshd_down
             unconfig
-
-            rm -f .external_hostname
         )
     ;;
     *)
